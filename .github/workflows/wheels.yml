@@ -113,15 +113,24 @@ jobs:
           name: cibw-wheels-manylinux_2_28_${{ matrix.config.arch }}-${{ matrix.python }}-wheels-upload
           path: ./wheelhouse/*.whl
 
-      - name: Setup obsutil
-        if: github.event_name != 'pull_request'
-        uses: ./.github/actions/setup-obsutil
-        with:
-          ak: ${{ secrets.NIGHTLY_OBS_AK }}
-          sk: ${{ secrets.NIGHTLY_OBS_SK }}
-          arch: ${{ matrix.config.arch == 'x86_64' && 'amd64' || 'arm64' }}
-
-      - name: Upload wheels to OBS
+      - name: Setup obsutil and upload to OBS
         if: github.event_name != 'pull_request'
         shell: bash
-        run: obsutil/obsutil cp -u wheelhouse/*.whl "obs://ascend-artifcat-packages/pypi/packages/ascend/repos/pypi/triton-ascend/nightly/"
+        env:
+          AK: ${{ secrets.NIGHTLY_OBS_AK }}
+          SK: ${{ secrets.NIGHTLY_OBS_SK }}
+          ARCH: ${{ matrix.config.arch == 'x86_64' && 'amd64' || 'arm64' }}
+        run: |
+          set -eu
+          if [ -z "${AK}" ] || [ -z "${SK}" ]; then
+            echo "OBS credentials are empty."
+            exit 1
+          fi
+          curl -fL "https://obs-community.obs.cn-north-1.myhuaweicloud.com/obsutil/current/obsutil_linux_${ARCH}.tar.gz" -o obsutil.tar.gz
+          gzip -t obsutil.tar.gz || { echo "obsutil.tar.gz is not a valid gzip"; exit 1; }
+          tar xzf obsutil.tar.gz
+          rm -f obsutil.tar.gz
+          mv obsutil_linux_* obsutil
+
+          obsutil/obsutil config -i="${AK}" -k="${SK}" -e=https://obs.cn-north-4.myhuaweicloud.com
+          obsutil/obsutil cp -u wheelhouse/*.whl "obs://ascend-artifcat-packages/pypi/packages/ascend/repos/pypi/nightly/triton-ascend/"
