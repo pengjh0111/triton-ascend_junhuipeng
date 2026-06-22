@@ -564,17 +564,9 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       isConstantIntValue(mstate.dims.back(), memRefType.getShape().back())) {
     auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
     if (ptrStrides.back() == 2 && (memRefType.getShape().back() % 2 == 0)) {
-      if (isDiscrete) {
-        if (DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate,
-                                                   allocOp)
-                .succeeded()) {
-          return success();
-        }
-      } else {
-        if (DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate)
-                .succeeded()) {
-          return success();
-        }
+      if (DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate)
+              .succeeded()) {
+        return success();
       }
     }
   }
