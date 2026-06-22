@@ -22,7 +22,9 @@
 
 #include "ascend/include/Utils/InterleaveOptimization.h"
 #include "ascend/include/Utils/Utils.h"
+#include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -199,16 +201,21 @@ DeinterleaveStatusOptimization(triton::LoadOp op,
         loc, srcType, reinterpretCast.getViewSource(), castOffset, castSize,
         castStride);
 
-    // 3. Create new memref allocOp
-    auto newAllocOp = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(srcType.getShape(), srcType.getElementType()));
-
-    // 4. Implement memref copy and bufferization back to tensor
-    rewriter.create<memref::CopyOp>(loc, newCastOp.getResult(), newAllocOp);
-    Value newTensor = rewriter.create<bufferization::ToTensorOp>(
+    // 3. Load via hfusion.load (src is newCastOp viewed as tensor, dst is empty)
+    Value srcT = rewriter.create<bufferization::ToTensorOp>(
         loc,
         RankedTensorType::get(srcType.getShape(), srcType.getElementType()),
-        newAllocOp, true /* restrict */, true /* writable */);
+        newCastOp.getResult(), /*restrict=*/true, /*writable=*/false);
+    Value dstEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, srcType.getShape(), srcType.getElementType());
+    Value newTensor =
+        rewriter
+            .create<hfusion::LoadOp>(
+                loc,
+                TypeRange{RankedTensorType::get(srcType.getShape(),
+                                                srcType.getElementType())},
+                ValueRange{srcT}, ValueRange{dstEmpty})
+            ->getResult(0);
 
     // 5. Implement tensor extract_slice to represent deinterleave
     // Here use `castOffset` to determine whether even index deinterleave or
@@ -246,7 +253,7 @@ DeinterleaveStatusOptimization(triton::LoadOp op,
 
 LogicalResult DeinterleaveStatusWithMaskOptimization(
     triton::LoadOp op, triton::LoadOp::Adaptor adaptor,
-    ConversionPatternRewriter &rewriter, MaskState &mstate, Value localMem) {
+    ConversionPatternRewriter &rewriter, MaskState &mstate) {
   auto ptr = adaptor.getPtr();
   if (auto reinterpretCast = ptr.getDefiningOp<memref::ReinterpretCastOp>()) {
     auto loc = op.getLoc();
@@ -275,64 +282,55 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
         loc, srcType, reinterpretCast.getViewSource(), castOffset, castSize,
         castStride);
 
-    // 3. Create new memref allocOp
-    // To reuse existing linalg::fill, here need to change insertion point
-    auto savedInsertPoint = rewriter.saveInsertionPoint();
-    rewriter.setInsertionPointAfterValue(localMem);
-    auto newAllocOp = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(srcType.getShape(), srcType.getElementType()));
-    rewriter.restoreInsertionPoint(savedInsertPoint);
-
-    // 4. Broadcast other value by linalg.fill if necessary
-    auto other = op.getOther();
-    // While deinterleave optimization will just adjust last dimension info
-    // and origin mask state wouldn't involve last dimension. Therefore in
-    // current `scf.if + linalg.fill` combination, condition of `if` could be
-    // kept and just replace linalg.fill'
-    if (other) {
-      assert(localMem.hasOneUse() &&
-             llvm::isa<linalg::FillOp>(*(localMem.getUsers().begin())));
-      auto originFillOp =
-          llvm::dyn_cast<linalg::FillOp>(*(localMem.getUsers().begin()));
-
-      assert(llvm::isa<scf::IfOp>(originFillOp->getParentOp()));
-      auto ifOp = llvm::dyn_cast<scf::IfOp>(originFillOp->getParentOp());
-
-      auto newFillOp = ifOp.getThenBodyBuilder().create<linalg::FillOp>(
-          originFillOp.getLoc(), originFillOp.getInputs(),
-          ValueRange{newAllocOp});
-      rewriter.replaceOp(originFillOp, newFillOp);
-    }
-
-    // 5. Implement new subview, memref copy and bufferization back to tensor
+    // 3. Compute subview sizes (last dim doubled for expanded interleave type)
     SmallVector<OpFoldResult> subviewStrides(srcType.getRank(),
                                              rewriter.getIndexAttr(1));
     SmallVector<OpFoldResult> subviewOffsets = mstate.offsets;
     SmallVector<OpFoldResult> subviewSizes = mstate.dims;
-    // Just adjust last dimension size to double
     std::optional<int64_t> originSubviewLastDim =
         getConstantIntValue(subviewSizes.back());
     assert(originSubviewLastDim.has_value());
     subviewSizes.back() =
         rewriter.getIndexAttr(originSubviewLastDim.value() * 2);
 
+    // 4. Build full dst tensor; fill with other unconditionally if present
+    Value fullDst = rewriter.create<tensor::EmptyOp>(
+        loc, srcType.getShape(), srcType.getElementType());
+    auto other = op.getOther();
+    if (other) {
+      Value otherScalar =
+          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+      assert(otherScalar && "other value used in masked load produced by "
+                            "unsupported instruction!");
+      fullDst = rewriter
+                    .create<linalg::FillOp>(loc, ValueRange{otherScalar},
+                                            ValueRange{fullDst})
+                    .getResult(0);
+    }
+
+    // 5. hfusion.load on subview of newCastOp, insert_slice into fullDst
     auto argSubviewType = memref::SubViewOp::inferResultType(
         srcType, subviewOffsets, subviewSizes, subviewStrides);
-    // alloca subview type doesn't carry layout attribute
-    auto allocSubviewType = memref::SubViewOp::inferResultType(
-        newAllocOp.getType(), subviewOffsets, subviewSizes, subviewStrides);
-
     memref::SubViewOp srcSubview = rewriter.create<memref::SubViewOp>(
         loc, llvm::cast<MemRefType>(argSubviewType), newCastOp, subviewOffsets,
         subviewSizes, subviewStrides);
-    memref::SubViewOp dstSubview = rewriter.create<memref::SubViewOp>(
-        loc, llvm::cast<MemRefType>(allocSubviewType), newAllocOp,
-        subviewOffsets, subviewSizes, subviewStrides);
-    rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
-    Value newTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc,
-        RankedTensorType::get(srcType.getShape(), srcType.getElementType()),
-        newAllocOp, true /* restrict */, true /* writable */);
+    auto srcSubviewShape =
+        llvm::cast<MemRefType>(srcSubview.getType()).getShape();
+    Value srcSubT = rewriter.create<bufferization::ToTensorOp>(
+        loc, RankedTensorType::get(srcSubviewShape, srcType.getElementType()),
+        srcSubview.getResult(), /*restrict=*/true, /*writable=*/false);
+    Value loadDst = rewriter.create<tensor::EmptyOp>(
+        loc, subviewSizes, srcType.getElementType());
+    auto hfuseLoadTy = llvm::cast<RankedTensorType>(loadDst.getType());
+    Value loadedSlice =
+        rewriter
+            .create<hfusion::LoadOp>(loc, TypeRange{hfuseLoadTy},
+                                     ValueRange{srcSubT}, ValueRange{loadDst})
+            ->getResult(0);
+    SmallVector<OpFoldResult> unitStrides(srcType.getRank(),
+                                          rewriter.getIndexAttr(1));
+    Value newTensor = rewriter.create<tensor::InsertSliceOp>(
+        loc, loadedSlice, fullDst, subviewOffsets, subviewSizes, unitStrides);
 
     // 6. Implement tensor extract_slice to represent deinterleave
     // Here use `castOffset` to determine whether even index deinterleave or

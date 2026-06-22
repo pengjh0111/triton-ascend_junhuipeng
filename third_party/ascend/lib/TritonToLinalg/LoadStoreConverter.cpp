@@ -311,9 +311,12 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
   auto memRefShape = memRefType.getShape();
   auto memRefElementType = memRefType.getElementType();
 
+  // Discrete path: keep original alloc+copy approach for the special
+  // loop-carried buffer structure that addptr converter established.
   Value allocOp;
   Value allocOpTmp;
-  if (op->hasAttr(ConverterUtils::discreteAttrName)) {
+  bool isDiscrete = op->hasAttr(ConverterUtils::discreteAttrName);
+  if (isDiscrete) {
     Operation *loop = op->getParentOp();
     int extractedLoopCount = 1;
     for (auto parentOp = loop->getParentOp();
@@ -356,19 +359,16 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     rewriter.replaceAllUsesExcept(insertSliceOp.getResult(),
                                   insertSliceOp.getDest(), insertSliceOp);
     rewriter.eraseOp(insertSliceOp);
-  } else {
-    allocOp = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(memRefShape, memRefElementType));
   }
 
   auto tensorType = RankedTensorType::get(memRefShape, memRefElementType);
-  // boundary check
   auto boundaryCheck = op.getBoundaryCheck();
+
+  // Branch C: boundary-check loads
   if (!boundaryCheck.empty()) {
     auto makeTensorPtrOp = op.getPtr().getDefiningOp<triton::MakeTensorPtrOp>();
     auto boundarySizes = mlir::ConverterUtils::getBoundarySizes(
         boundaryCheck, /*remapped*/ ptr, loc, rewriter);
-    // handle the padding
     auto padding = op.getPadding();
     SmallVector<OpFoldResult> srcOffsets(boundarySizes.size(),
                                          rewriter.getIndexAttr(0));
@@ -401,38 +401,92 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     } else {
       dstOffsets = srcOffsets;
     }
+
+    if (isDiscrete) {
+      // Discrete: use original memref.copy approach
+      if (padding.has_value()) {
+        TypedAttr padAttr = rewriter.getZeroAttr(memRefElementType);
+        if (padding.value() == triton::PaddingOption::PAD_NAN) {
+          assert(!memRefElementType.isIntOrIndex());
+          auto apNaN = llvm::APFloat::getNaN(
+              cast<FloatAttr>(padAttr).getValue().getSemantics());
+          padAttr = rewriter.getFloatAttr(memRefElementType, apNaN);
+        }
+        auto padVal = rewriter.create<arith::ConstantOp>(loc, padAttr);
+        fillTensorWithOtherForMaskScenario(padVal, allocOp, boundarySizes,
+                                           rewriter);
+      }
+      auto srcSubView = mlir::ConverterUtils::makeSubViewOp(
+          ptr, srcOffsets, boundarySizes, loc, rewriter);
+      auto dstSubview = mlir::ConverterUtils::makeSubViewOp(
+          allocOp, dstOffsets, boundarySizes, loc, rewriter);
+      auto copyOp =
+          rewriter.create<memref::CopyOp>(loc, srcSubView, dstSubview);
+      propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(),
+                                 rewriter);
+      if (mayImplicitTransposeWithLastAxis) {
+        auto markOp = rewriter.create<annotation::MarkOp>(loc, dstSubview);
+        markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
+                        UnitAttr::get(rewriter.getContext()));
+      }
+      return this->toTensorAndReplace(op, tensorType, allocOp,
+                                      mayImplicitTransposeWithLastAxis, loc,
+                                      rewriter);
+    }
+
+    // Non-discrete: hfusion.load on src subview, insert_slice into full dst
+    auto srcSubView = mlir::ConverterUtils::makeSubViewOp(
+        ptr, srcOffsets, boundarySizes, loc, rewriter);
+    auto srcSubViewType = cast<MemRefType>(srcSubView.getType());
+    auto srcShape = srcSubViewType.getShape();
+    Value srcT = rewriter.create<bufferization::ToTensorOp>(
+        loc, RankedTensorType::get(srcShape, memRefElementType),
+        srcSubView.getResult(), /*restrict=*/true, /*writable=*/false);
+    Value loadDst =
+        rewriter.create<tensor::EmptyOp>(loc, boundarySizes, memRefElementType);
+    auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
+    auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
+        loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
+    propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
+                               rewriter);
+    Value loaded = hfuseLoad->getResult(0);
+
+    Value dstTensor;
     if (padding.has_value()) {
       TypedAttr padAttr = rewriter.getZeroAttr(memRefElementType);
-      // triton already ensure only NAN and ZERO are passed in
+      // triton already ensures only NAN and ZERO are passed in
       if (padding.value() == triton::PaddingOption::PAD_NAN) {
-        // FIXME: Why NaN requires elemTy to be non-int or non-index?
         assert(!memRefElementType.isIntOrIndex());
         auto apNaN = llvm::APFloat::getNaN(
             cast<FloatAttr>(padAttr).getValue().getSemantics());
         padAttr = rewriter.getFloatAttr(memRefElementType, apNaN);
       }
       auto padVal = rewriter.create<arith::ConstantOp>(loc, padAttr);
-
-      fillTensorWithOtherForMaskScenario(padVal, allocOp, boundarySizes,
-                                         rewriter);
+      Value fullEmpty =
+          rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+      dstTensor =
+          rewriter
+              .create<linalg::FillOp>(loc, ValueRange{padVal.getResult()},
+                                      ValueRange{fullEmpty})
+              .getResult(0);
+    } else {
+      dstTensor =
+          rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
     }
-    auto srcSubView = mlir::ConverterUtils::makeSubViewOp(
-        ptr, srcOffsets, boundarySizes, loc, rewriter);
-    auto dstSubview = mlir::ConverterUtils::makeSubViewOp(
-        allocOp, dstOffsets, boundarySizes, loc, rewriter);
-    auto copyOp = rewriter.create<memref::CopyOp>(loc, srcSubView, dstSubview);
-    propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(),
-                               rewriter);
+    SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
+                                          rewriter.getIndexAttr(1));
+    Value result = rewriter.create<tensor::InsertSliceOp>(
+        loc, loaded, dstTensor, dstOffsets, boundarySizes, unitStrides);
     if (mayImplicitTransposeWithLastAxis) {
-      auto markOp = rewriter.create<annotation::MarkOp>(loc, dstSubview);
+      auto markOp = rewriter.create<annotation::MarkOp>(loc, result);
       markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
                       UnitAttr::get(rewriter.getContext()));
     }
-    return this->toTensorAndReplace(op, tensorType, allocOp,
-                                    mayImplicitTransposeWithLastAxis, loc,
-                                    rewriter);
+    rewriter.replaceOp(op, result);
+    return success();
   }
 
+  // Branch A: no-mask loads
   if (!mask) {
     assert(!other && "can not input 'other' when 'mask' is not set");
     if (auto unrealizedCastOp =
@@ -441,14 +495,17 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       // hint : can be handled in Linearize
       op->emitError("meeting unexpected UCC in LoadConverter!");
       return failure();
-    } else {
-      // If last dimension stride equals 2, try deinterleave optimization.
-      auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
-      if (ptrStrides.back() == 2 && (memRefShape.back() % 2 == 0) &&
-          mlir::triton::DeinterleaveStatusOptimization(op, adaptor, rewriter)
-              .succeeded()) {
-        return success();
-      }
+    }
+    // If last dimension stride equals 2, try deinterleave optimization.
+    auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
+    if (ptrStrides.back() == 2 && (memRefShape.back() % 2 == 0) &&
+        mlir::triton::DeinterleaveStatusOptimization(op, adaptor, rewriter)
+            .succeeded()) {
+      return success();
+    }
+
+    if (isDiscrete) {
+      // Discrete: use original memref.copy approach
       auto copyOp = rewriter.create<memref::CopyOp>(loc, ptr, allocOp);
       propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(),
                                  rewriter);
@@ -463,29 +520,37 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
         markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
                         UnitAttr::get(rewriter.getContext()));
       }
+      return this->toTensorAndReplace(op, tensorType, allocOp,
+                                      mayImplicitTransposeWithLastAxis, loc,
+                                      rewriter);
     }
 
-    return this->toTensorAndReplace(op, tensorType, allocOp,
-                                    mayImplicitTransposeWithLastAxis, loc,
-                                    rewriter);
+    // Non-discrete: hfusion.load directly on ptr
+    Value srcT = rewriter.create<bufferization::ToTensorOp>(
+        loc, RankedTensorType::get(memRefShape, memRefElementType), ptr,
+        /*restrict=*/true, /*writable=*/false);
+    Value dstEmpty =
+        rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+    auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
+        loc, TypeRange{tensorType}, ValueRange{srcT}, ValueRange{dstEmpty});
+    propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
+                               rewriter);
+    Value result = hfuseLoad->getResult(0);
+    if (mayImplicitTransposeWithLastAxis) {
+      auto markOp = rewriter.create<annotation::MarkOp>(loc, result);
+      markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
+                      UnitAttr::get(rewriter.getContext()));
+    }
+    rewriter.replaceOp(op, result);
+    return success();
   }
 
+  // Branch B: continuous-mask loads
   MaskState mstate;
   auto isContMask = mstate.parse(mask, loc, rewriter);
   if (isContMask.failed()) {
     return rewriter.notifyMatchFailure(
         op, "can not lower uncontinuout masked loads");
-  }
-
-  if (other) {
-    auto scalarOther =
-        mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
-    assert(
-        scalarOther &&
-        "other value used in masked load produced by unsupported instruction!");
-
-    fillTensorWithOtherForMaskScenario(scalarOther, allocOp, mstate.dims,
-                                       rewriter);
   }
 
   // To enable deinterleave optimization with mask load, mask state along last
@@ -498,11 +563,19 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       isConstantIntValue(mstate.offsets.back(), 0) &&
       isConstantIntValue(mstate.dims.back(), memRefType.getShape().back())) {
     auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
-    if (ptrStrides.back() == 2 && (memRefType.getShape().back() % 2 == 0) &&
-        DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate,
-                                               allocOp)
-            .succeeded()) {
-      return success();
+    if (ptrStrides.back() == 2 && (memRefType.getShape().back() % 2 == 0)) {
+      if (isDiscrete) {
+        if (DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate,
+                                                   allocOp)
+                .succeeded()) {
+          return success();
+        }
+      } else {
+        if (DeinterleaveStatusWithMaskOptimization(op, adaptor, rewriter, mstate)
+                .succeeded()) {
+          return success();
+        }
+      }
     }
   }
 
@@ -511,23 +584,36 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     // hint : can be handled in Linearize
     op->emitError("meeting unexpected UCC in LoadConverter!");
     return failure();
-  } else {
+  }
+
+  if (isDiscrete) {
+    // Discrete: use original memref.copy approach
+    if (other) {
+      auto scalarOther =
+          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+      assert(scalarOther && "other value used in masked load produced by "
+                            "unsupported instruction!");
+      fillTensorWithOtherForMaskScenario(scalarOther, allocOp, mstate.dims,
+                                         rewriter);
+    }
     if (mstate.isMemrefSubviewValid(ptr, rewriter)) {
       memref::SubViewOp srcSubView = mstate.getSubview(ptr, loc, rewriter);
-      memref::SubViewOp dstSubView = mstate.getSubview(allocOp, loc, rewriter);
-      MemRefType dstSubViewType = mlir::cast<MemRefType>(dstSubView.getType());
-
+      memref::SubViewOp dstSubView =
+          mstate.getSubview(allocOp, loc, rewriter);
+      MemRefType dstSubViewType =
+          mlir::cast<MemRefType>(dstSubView.getType());
       auto [srcStrides, srcOffset] = dstSubViewType.getStridesAndOffset();
       MemRefType castType = MemRefType::get(
           dstSubViewType.getShape(), dstSubViewType.getElementType(),
           makeStridedLinearLayoutMap(srcStrides, srcOffset,
                                      rewriter.getContext()));
-      auto castOp = rewriter.create<memref::CastOp>(loc, castType, dstSubView);
-      auto copyOp = rewriter.create<memref::CopyOp>(loc, srcSubView, castOp);
+      auto castOp =
+          rewriter.create<memref::CastOp>(loc, castType, dstSubView);
+      auto copyOp =
+          rewriter.create<memref::CopyOp>(loc, srcSubView, castOp);
       propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(),
                                  rewriter);
     }
-
     if (mayImplicitTransposeWithLastAxis &&
         allocOp.getDefiningOp<memref::AllocOp>()) {
       auto markOp = rewriter.create<annotation::MarkOp>(loc, allocOp);
@@ -539,9 +625,57 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
                       UnitAttr::get(rewriter.getContext()));
     }
+    return this->toTensorAndReplace(op, tensorType, allocOp,
+                                    mayImplicitTransposeWithLastAxis, loc,
+                                    rewriter);
   }
-  return this->toTensorAndReplace(
-      op, tensorType, allocOp, mayImplicitTransposeWithLastAxis, loc, rewriter);
+
+  // Non-discrete: hfusion.load on mask subview, insert_slice into full dst
+  Value fullDst =
+      rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+  if (other) {
+    auto scalarOther =
+        mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+    assert(scalarOther && "other value used in masked load produced by "
+                          "unsupported instruction!");
+    fullDst =
+        rewriter
+            .create<linalg::FillOp>(loc, ValueRange{scalarOther},
+                                    ValueRange{fullDst})
+            .getResult(0);
+  }
+
+  Value result;
+  if (mstate.isMemrefSubviewValid(ptr, rewriter)) {
+    memref::SubViewOp srcSubView = mstate.getSubview(ptr, loc, rewriter);
+    auto srcSubViewType = cast<MemRefType>(srcSubView.getType());
+    auto srcShape = srcSubViewType.getShape();
+    Value srcT = rewriter.create<bufferization::ToTensorOp>(
+        loc, RankedTensorType::get(srcShape, memRefElementType),
+        srcSubView.getResult(), /*restrict=*/true, /*writable=*/false);
+    Value loadDst =
+        rewriter.create<tensor::EmptyOp>(loc, mstate.dims, memRefElementType);
+    auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
+    auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
+        loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
+    propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
+                               rewriter);
+    Value loaded = hfuseLoad->getResult(0);
+    SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
+                                          rewriter.getIndexAttr(1));
+    result = rewriter.create<tensor::InsertSliceOp>(
+        loc, loaded, fullDst, mstate.offsets, mstate.dims, unitStrides);
+  } else {
+    result = fullDst;
+  }
+
+  if (mayImplicitTransposeWithLastAxis) {
+    auto markOp = rewriter.create<annotation::MarkOp>(loc, result);
+    markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
+                    UnitAttr::get(rewriter.getContext()));
+  }
+  rewriter.replaceOp(op, result);
+  return success();
 }
 
 AtomicRMWConverter::AtomicRMWConverter(MLIRContext *context)

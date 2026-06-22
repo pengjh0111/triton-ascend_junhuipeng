@@ -106,3 +106,4 @@ dist/
 *.egg-info/
 .eggs/
 docs/zh/python-api/generated/
+.claude/
