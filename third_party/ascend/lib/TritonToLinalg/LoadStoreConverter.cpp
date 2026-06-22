@@ -464,11 +464,8 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       auto padVal = rewriter.create<arith::ConstantOp>(loc, padAttr);
       Value fullEmpty =
           rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
-      dstTensor =
-          rewriter
-              .create<linalg::FillOp>(loc, ValueRange{padVal.getResult()},
-                                      ValueRange{fullEmpty})
-              .getResult(0);
+      dstTensor = mlir::ConverterUtils::buildConditionalFillTensor(
+          rewriter, loc, padVal.getResult(), fullEmpty, boundarySizes);
     } else {
       dstTensor =
           rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
@@ -630,11 +627,8 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
         mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
     assert(scalarOther && "other value used in masked load produced by "
                           "unsupported instruction!");
-    fullDst =
-        rewriter
-            .create<linalg::FillOp>(loc, ValueRange{scalarOther},
-                                    ValueRange{fullDst})
-            .getResult(0);
+    fullDst = mlir::ConverterUtils::buildConditionalFillTensor(
+        rewriter, loc, scalarOther, fullDst, mstate.dims);
   }
 
   Value result;

@@ -153,6 +153,16 @@ SmallVector<int64_t> getBroadcastDims(RankedTensorType src,
 SmallVector<int64_t> getUnbroadcastDims(RankedTensorType src,
                                         RankedTensorType dst);
 
+// Conditionally fill emptyTensor with scalarOther only when validSizes are
+// strictly smaller than the full tensor shape in any dimension. Generates
+// scf.if(fillFlag){ linalg.fill } else { emptyTensor } with
+// hivm.unlikely_condition. Returns emptyTensor unchanged if scalarOther is
+// null.
+Value buildConditionalFillTensor(ConversionPatternRewriter &rewriter,
+                                 Location loc, Value scalarOther,
+                                 Value emptyTensor,
+                                 ArrayRef<OpFoldResult> validSizes);
+
 } // namespace ConverterUtils
 
 class ConversionPatternRewriter;

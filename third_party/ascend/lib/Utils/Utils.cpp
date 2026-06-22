@@ -453,6 +453,64 @@ SmallVector<int64_t> getUnbroadcastDims(RankedTensorType src,
   return unbroadcastDims;
 }
 
+Value buildConditionalFillTensor(ConversionPatternRewriter &rewriter,
+                                 Location loc, Value scalarOther,
+                                 Value emptyTensor,
+                                 ArrayRef<OpFoldResult> validSizes) {
+  if (!scalarOther)
+    return emptyTensor;
+
+  auto tensorType = cast<RankedTensorType>(emptyTensor.getType());
+  assert(tensorType.hasStaticShape() && "only support static shape");
+  assert((size_t)tensorType.getRank() == validSizes.size() &&
+         "validSizes and tensor must have same rank");
+
+  // fillFlag: true if any valid dimension is smaller than the full shape,
+  // meaning some padding region exists and needs to be filled.
+  Value fillFlag =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false))
+          .getResult();
+
+  for (size_t i = 0; i < validSizes.size(); ++i) {
+    auto shapeVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIndexAttr(tensorType.getDimSize(i)));
+
+    Value validSizeVal;
+    if (isa<Attribute>(validSizes[i]))
+      validSizeVal = rewriter.create<arith::ConstantOp>(
+          loc, cast<IntegerAttr>(cast<Attribute>(validSizes[i])));
+    else
+      validSizeVal = cast<Value>(validSizes[i]);
+
+    auto curCmp = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, validSizeVal, shapeVal);
+    fillFlag =
+        rewriter.create<arith::OrIOp>(loc, fillFlag, curCmp.getResult())
+            .getResult();
+  }
+
+  auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{tensorType}, fillFlag,
+                                          /*withElseRegion=*/true);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(&ifOp.getThenRegion().front());
+    Value filled =
+        rewriter
+            .create<linalg::FillOp>(loc, ValueRange{scalarOther},
+                                    ValueRange{emptyTensor})
+            .getResult(0);
+    rewriter.create<scf::YieldOp>(loc, filled);
+  }
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(&ifOp.getElseRegion().front());
+    rewriter.create<scf::YieldOp>(loc, emptyTensor);
+  }
+  ifOp->setAttr(rewriter.getStringAttr("hivm.unlikely_condition"),
+                UnitAttr::get(rewriter.getContext()));
+  return ifOp->getResult(0);
+}
+
 } // namespace ConverterUtils
 
 namespace triton {

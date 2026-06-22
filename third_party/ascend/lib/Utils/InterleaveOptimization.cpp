@@ -293,7 +293,7 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
     subviewSizes.back() =
         rewriter.getIndexAttr(originSubviewLastDim.value() * 2);
 
-    // 4. Build full dst tensor; fill with other unconditionally if present
+    // 4. Build full dst tensor; conditionally fill with other if present
     Value fullDst = rewriter.create<tensor::EmptyOp>(
         loc, srcType.getShape(), srcType.getElementType());
     auto other = op.getOther();
@@ -302,10 +302,8 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
           mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
       assert(otherScalar && "other value used in masked load produced by "
                             "unsupported instruction!");
-      fullDst = rewriter
-                    .create<linalg::FillOp>(loc, ValueRange{otherScalar},
-                                            ValueRange{fullDst})
-                    .getResult(0);
+      fullDst = mlir::ConverterUtils::buildConditionalFillTensor(
+          rewriter, loc, otherScalar, fullDst, subviewSizes);
     }
 
     // 5. hfusion.load on subview of newCastOp, insert_slice into fullDst
