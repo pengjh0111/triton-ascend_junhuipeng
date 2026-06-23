@@ -57,22 +57,11 @@ private:
   void propagateWasBoolToInt8Attr(Operation *srcLoadOp, Operation *dstOp,
                                   PatternRewriter &rewriter) const;
 
-  LogicalResult toTensorAndReplace(triton::LoadOp &op,
-                                   RankedTensorType &tensorType, Value localMem,
-                                   bool mayImplicitTransposeWithLastAxis,
-                                   const Location &loc,
-                                   ConversionPatternRewriter &rewriter) const;
-
   LogicalResult checkModifiedByAddPtrConverter(triton::LoadOp &op) const;
 
   LogicalResult
   continueModifyFromAddPtrConverter(triton::LoadOp &op, OpAdaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const;
-
-  void
-  fillTensorWithOtherForMaskScenario(Value other, Value localMem,
-                                     ArrayRef<OpFoldResult> maskDim,
-                                     ConversionPatternRewriter &rewriter) const;
 
 public:
   explicit LoadConverter(MLIRContext *context);
