@@ -1072,7 +1072,7 @@ void TritonToLinalgPass::runOnOperation() {
     Value dest = destVal;
     if (auto toTensorOp =
             destVal.getDefiningOp<bufferization::ToTensorOp>())
-      dest = toTensorOp.getMemref();
+      dest = toTensorOp.getOperand(0);
 
     if (auto reinterpretCastOp =
             dest.getDefiningOp<memref::ReinterpretCastOp>()) {

@@ -371,7 +371,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
     Value dest = storeOp.getOutputs().front();
     if (auto toTensorOp = dest.getDefiningOp<bufferization::ToTensorOp>())
-      dest = toTensorOp.getMemref();
+      dest = toTensorOp.getOperand(0);
     return dest;
   };
 
@@ -524,7 +524,7 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
   auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
     Value dest = storeOp.getOutputs().front();
     if (auto toTensorOp = dest.getDefiningOp<bufferization::ToTensorOp>())
-      dest = toTensorOp.getMemref();
+      dest = toTensorOp.getOperand(0);
     return dest;
   };
 
