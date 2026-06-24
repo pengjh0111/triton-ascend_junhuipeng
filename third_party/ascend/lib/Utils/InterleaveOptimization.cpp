@@ -368,14 +368,12 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   auto loc = materializeVec[1]->getLoc();
 
   auto firstReinterpretCastOp =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[0])
-          .getDest()
+      llvm::cast<hfusion::StoreOp>(materializeVec[0])
+          .getOutputs().front()
           .getDefiningOp<memref::ReinterpretCastOp>();
   auto secondReinterpretCastOp =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[1])
-          .getDest()
+      llvm::cast<hfusion::StoreOp>(materializeVec[1])
+          .getOutputs().front()
           .getDefiningOp<memref::ReinterpretCastOp>();
 
   assert(firstReinterpretCastOp && secondReinterpretCastOp);
@@ -468,9 +466,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   }
   auto insertFirst = builder.create<tensor::InsertSliceOp>(
       loc,
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[0])
-          .getSource(),
+      llvm::cast<hfusion::StoreOp>(materializeVec[0]).getInputs().front(),
       emptyTensor.getResult(), insertOffsets, insertSizes, insertStrides);
 
   if (indexModeRecord.second == IndexMode::ODD_MODE) {
@@ -480,9 +476,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   }
   auto insertSecond = builder.create<tensor::InsertSliceOp>(
       loc,
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[1])
-          .getSource(),
+      llvm::cast<hfusion::StoreOp>(materializeVec[1]).getInputs().front(),
       insertFirst.getResult(), insertOffsets, insertSizes, insertStrides);
 
   // 4. Reinterpret_cast block arg
@@ -494,13 +488,14 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
       loc, dstType, firstReinterpretCastOp.getViewSource(), newCastOffset,
       newCastSize, newCastStride);
 
-  // 5. Create new bufferization::MaterializeInDestinationOp
-  auto newStoreOp = builder.create<bufferization::MaterializeInDestinationOp>(
-      loc, insertSecond.getResult(), newCastOp.getResult());
-  // Setting writable is necessary as dst is memref type
-  newStoreOp.setWritable(true);
+  // 5. Create new hfusion::StoreOp
+  builder.create<hfusion::StoreOp>(loc, TypeRange{},
+                                   ValueRange{insertSecond.getResult()},
+                                   ValueRange{newCastOp.getResult()},
+                                   hfusion::AtomicKind::NONE,
+                                   ArrayRef<NamedAttribute>{});
 
-  // 6. Erase origin materialization
+  // 6. Erase origin stores
   materializeVec[0]->erase();
   materializeVec[1]->erase();
 
@@ -512,27 +507,23 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
   OpBuilder builder(materializeVec[1]);
 
   auto firstSubviewOpOfReCast =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[0])
-          .getDest()
+      llvm::cast<hfusion::StoreOp>(materializeVec[0])
+          .getOutputs().front()
           .getDefiningOp<memref::SubViewOp>();
   auto firstSrcExtractSlice =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[0])
-          .getSource()
+      llvm::cast<hfusion::StoreOp>(materializeVec[0])
+          .getInputs().front()
           .getDefiningOp<tensor::ExtractSliceOp>();
   auto firstReinterpretCastOp = firstSubviewOpOfReCast.getSource()
                                     .getDefiningOp<memref::ReinterpretCastOp>();
 
   auto secondSubviewOpOfReCast =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[1])
-          .getDest()
+      llvm::cast<hfusion::StoreOp>(materializeVec[1])
+          .getOutputs().front()
           .getDefiningOp<memref::SubViewOp>();
   auto secondSrcExtractSlice =
-      llvm::dyn_cast<bufferization::MaterializeInDestinationOp>(
-          materializeVec[1])
-          .getSource()
+      llvm::cast<hfusion::StoreOp>(materializeVec[1])
+          .getInputs().front()
           .getDefiningOp<tensor::ExtractSliceOp>();
   auto secondReinterpretCastOp =
       secondSubviewOpOfReCast.getSource()
@@ -692,11 +683,12 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
       loc, llvm::cast<MemRefType>(dstSubviewType), newCastOp, extractOffsets,
       extractSizes, extractStrides);
 
-  // 7. Create new bufferization::MaterializeInDestinationOp
-  auto newStoreOp = builder.create<bufferization::MaterializeInDestinationOp>(
-      loc, newSrcExtractSlice.getResult(), newSubviewOpOfReCast.getResult());
-  // Setting writable is necessary as dst is memref type
-  newStoreOp.setWritable(true);
+  // 7. Create new hfusion::StoreOp
+  builder.create<hfusion::StoreOp>(loc, TypeRange{},
+                                   ValueRange{newSrcExtractSlice.getResult()},
+                                   ValueRange{newSubviewOpOfReCast.getResult()},
+                                   hfusion::AtomicKind::NONE,
+                                   ArrayRef<NamedAttribute>{});
 
   // 8. Erase origin operation
   materializeVec[0]->erase();

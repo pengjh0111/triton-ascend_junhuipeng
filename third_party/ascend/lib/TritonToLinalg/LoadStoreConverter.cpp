@@ -1079,18 +1079,22 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
         val, srcOffsets, boundarySizes, loc, rewriter);
     auto dstSubview = mlir::ConverterUtils::makeSubViewOp(
         ptr, dstOffsets, boundarySizes, loc, rewriter);
-    auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
-        loc, srcSlice, dstSubview);
-    storeOp.setWritable(true);
+    rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
+                                      ValueRange{srcSlice},
+                                      ValueRange{dstSubview},
+                                      hfusion::AtomicKind::NONE,
+                                      ArrayRef<NamedAttribute>{});
     rewriter.eraseOp(op);
     return success();
   }
 
-  // 2. Simple load with no mask
+  // 2. Simple store with no mask
   if (!mask) {
-    auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
-        loc, val, ptr);
-    storeOp.setWritable(true);
+    rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
+                                      ValueRange{val},
+                                      ValueRange{ptr},
+                                      hfusion::AtomicKind::NONE,
+                                      ArrayRef<NamedAttribute>{});
     rewriter.eraseOp(op);
     return success();
   }
@@ -1107,9 +1111,11 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << "\n"; });
   auto srcSlice = mstate.getExtractSlice(val, loc, rewriter);
   auto dstSubview = mstate.getSubview(ptr, loc, rewriter);
-  auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
-      loc, srcSlice, dstSubview);
-  storeOp.setWritable(true);
+  rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
+                                    ValueRange{srcSlice},
+                                    ValueRange{dstSubview},
+                                    hfusion::AtomicKind::NONE,
+                                    ArrayRef<NamedAttribute>{});
   rewriter.eraseOp(op);
   return success();
 }

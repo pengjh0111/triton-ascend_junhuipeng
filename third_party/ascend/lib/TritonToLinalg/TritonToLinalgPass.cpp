@@ -1064,24 +1064,24 @@ void TritonToLinalgPass::runOnOperation() {
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>> interleaveCandidate;
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>>
       interleaveCandidateWithMask;
-  moduleOp.walk([&](bufferization::MaterializeInDestinationOp materializeOp) {
+  moduleOp.walk([&](hfusion::StoreOp storeOp) {
+    auto dest = storeOp.getOutputs().front();
+    auto source = storeOp.getInputs().front();
+
     if (auto reinterpretCastOp =
-            materializeOp.getDest()
-                .getDefiningOp<memref::ReinterpretCastOp>()) {
+            dest.getDefiningOp<memref::ReinterpretCastOp>()) {
       if (llvm::isa<BlockArgument>(reinterpretCastOp.getSource()) &&
           reinterpretCastOp.getStaticStrides().back() == 2) {
         interleaveCandidate[llvm::cast<BlockArgument>(
                                 reinterpretCastOp.getSource())]
-            .push_back(materializeOp);
+            .push_back(storeOp);
       }
     }
 
     // Difference is that converted op chain of store with mask has
     // `memref::SubViewOp`
-    if (auto subviewOp =
-            materializeOp.getDest().getDefiningOp<memref::SubViewOp>()) {
-      if (!llvm::isa<tensor::ExtractSliceOp>(
-              materializeOp.getSource().getDefiningOp()))
+    if (auto subviewOp = dest.getDefiningOp<memref::SubViewOp>()) {
+      if (!llvm::isa<tensor::ExtractSliceOp>(source.getDefiningOp()))
         return WalkResult::advance();
 
       if (auto reinterpretCastOp =
@@ -1091,7 +1091,7 @@ void TritonToLinalgPass::runOnOperation() {
             reinterpretCastOp.getStaticStrides().back() == 2) {
           interleaveCandidateWithMask[llvm::cast<BlockArgument>(
                                           reinterpretCastOp.getSource())]
-              .push_back(materializeOp);
+              .push_back(storeOp);
         }
       }
     }
