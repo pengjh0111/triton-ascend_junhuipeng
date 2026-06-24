@@ -1065,8 +1065,14 @@ void TritonToLinalgPass::runOnOperation() {
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>>
       interleaveCandidateWithMask;
   moduleOp.walk([&](hfusion::StoreOp storeOp) {
-    auto dest = storeOp.getOutputs().front();
+    auto destVal = storeOp.getOutputs().front();
     auto source = storeOp.getInputs().front();
+
+    // Scheme B wraps the dest memref in bufferization.to_tensor; unwrap it.
+    Value dest = destVal;
+    if (auto toTensorOp =
+            destVal.getDefiningOp<bufferization::ToTensorOp>())
+      dest = toTensorOp.getMemref();
 
     if (auto reinterpretCastOp =
             dest.getDefiningOp<memref::ReinterpretCastOp>()) {

@@ -367,13 +367,19 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   OpBuilder builder(materializeVec[1]);
   auto loc = materializeVec[1]->getLoc();
 
+  // Scheme B wraps dest in bufferization.to_tensor; unwrap to reach the memref.
+  auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
+    Value dest = storeOp.getOutputs().front();
+    if (auto toTensorOp = dest.getDefiningOp<bufferization::ToTensorOp>())
+      dest = toTensorOp.getMemref();
+    return dest;
+  };
+
   auto firstReinterpretCastOp =
-      llvm::cast<hfusion::StoreOp>(materializeVec[0])
-          .getOutputs().front()
+      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[0]))
           .getDefiningOp<memref::ReinterpretCastOp>();
   auto secondReinterpretCastOp =
-      llvm::cast<hfusion::StoreOp>(materializeVec[1])
-          .getOutputs().front()
+      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[1]))
           .getDefiningOp<memref::ReinterpretCastOp>();
 
   assert(firstReinterpretCastOp && secondReinterpretCastOp);
@@ -488,10 +494,20 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
       loc, dstType, firstReinterpretCastOp.getViewSource(), newCastOffset,
       newCastSize, newCastStride);
 
-  // 5. Create new hfusion::StoreOp
-  builder.create<hfusion::StoreOp>(loc, TypeRange{},
-                                   ValueRange{insertSecond.getResult()},
-                                   ValueRange{newCastOp.getResult()});
+  // 5. Create new tensor-level hfusion::StoreOp + materialize write-back
+  {
+    auto srcTensor = insertSecond.getResult();
+    auto dstMemref = newCastOp.getResult();
+    auto tTy = cast<RankedTensorType>(srcTensor.getType());
+    Value dstT = builder.create<bufferization::ToTensorOp>(
+        loc, tTy, dstMemref, /*restrict=*/true, /*writable=*/true);
+    auto storeOp = builder.create<hfusion::StoreOp>(
+        loc, TypeRange{tTy}, ValueRange{srcTensor}, ValueRange{dstT});
+    Value stored = storeOp->getResult(0);
+    auto mz = builder.create<bufferization::MaterializeInDestinationOp>(
+        loc, stored, dstMemref);
+    mz.setWritable(true);
+  }
 
   // 6. Erase origin stores
   materializeVec[0]->erase();
@@ -504,9 +520,16 @@ LogicalResult
 InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
   OpBuilder builder(materializeVec[1]);
 
+  // Scheme B wraps dest in bufferization.to_tensor; unwrap to reach the memref.
+  auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
+    Value dest = storeOp.getOutputs().front();
+    if (auto toTensorOp = dest.getDefiningOp<bufferization::ToTensorOp>())
+      dest = toTensorOp.getMemref();
+    return dest;
+  };
+
   auto firstSubviewOpOfReCast =
-      llvm::cast<hfusion::StoreOp>(materializeVec[0])
-          .getOutputs().front()
+      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[0]))
           .getDefiningOp<memref::SubViewOp>();
   auto firstSrcExtractSlice =
       llvm::cast<hfusion::StoreOp>(materializeVec[0])
@@ -516,8 +539,7 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
                                     .getDefiningOp<memref::ReinterpretCastOp>();
 
   auto secondSubviewOpOfReCast =
-      llvm::cast<hfusion::StoreOp>(materializeVec[1])
-          .getOutputs().front()
+      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[1]))
           .getDefiningOp<memref::SubViewOp>();
   auto secondSrcExtractSlice =
       llvm::cast<hfusion::StoreOp>(materializeVec[1])
@@ -681,10 +703,20 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
       loc, llvm::cast<MemRefType>(dstSubviewType), newCastOp, extractOffsets,
       extractSizes, extractStrides);
 
-  // 7. Create new hfusion::StoreOp
-  builder.create<hfusion::StoreOp>(loc, TypeRange{},
-                                   ValueRange{newSrcExtractSlice.getResult()},
-                                   ValueRange{newSubviewOpOfReCast.getResult()});
+  // 7. Create new tensor-level hfusion::StoreOp + materialize write-back
+  {
+    auto srcTensor = newSrcExtractSlice.getResult();
+    auto dstMemref = newSubviewOpOfReCast.getResult();
+    auto tTy = cast<RankedTensorType>(srcTensor.getType());
+    Value dstT = builder.create<bufferization::ToTensorOp>(
+        loc, tTy, dstMemref, /*restrict=*/true, /*writable=*/true);
+    auto storeOp = builder.create<hfusion::StoreOp>(
+        loc, TypeRange{tTy}, ValueRange{srcTensor}, ValueRange{dstT});
+    Value stored = storeOp->getResult(0);
+    auto mz = builder.create<bufferization::MaterializeInDestinationOp>(
+        loc, stored, dstMemref);
+    mz.setWritable(true);
+  }
 
   // 8. Erase origin operation
   materializeVec[0]->erase();

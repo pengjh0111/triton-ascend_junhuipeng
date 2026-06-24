@@ -1038,6 +1038,22 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   auto ptr = adaptor.getPtr();
   auto val = adaptor.getValue();
 
+  // hfusion.store is a linalg-structured op requiring pure tensor semantics.
+  // Pattern: to_tensor(dstMemref) → hfusion.store(ins=src, outs=dstTensor)
+  //          → result tensor → materialize_in_destination → dstMemref.
+  // materialize_in_destination remains responsible for the actual GM write.
+  auto emitTensorStore = [&](Value srcTensor, Value dstMemref) {
+    auto tTy = cast<RankedTensorType>(srcTensor.getType());
+    Value dstT = rewriter.create<bufferization::ToTensorOp>(
+        loc, tTy, dstMemref, /*restrict=*/true, /*writable=*/true);
+    auto storeOp = rewriter.create<hfusion::StoreOp>(
+        loc, TypeRange{tTy}, ValueRange{srcTensor}, ValueRange{dstT});
+    Value stored = storeOp->getResult(0);
+    auto mz = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, stored, dstMemref);
+    mz.setWritable(true);
+  };
+
   // 1. boundary size check
   auto boundaryCheck = op.getBoundaryCheck();
   if (!boundaryCheck.empty()) {
@@ -1079,18 +1095,14 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
         val, srcOffsets, boundarySizes, loc, rewriter);
     auto dstSubview = mlir::ConverterUtils::makeSubViewOp(
         ptr, dstOffsets, boundarySizes, loc, rewriter);
-    rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
-                                      ValueRange{srcSlice},
-                                      ValueRange{dstSubview});
+    emitTensorStore(srcSlice, dstSubview);
     rewriter.eraseOp(op);
     return success();
   }
 
   // 2. Simple store with no mask
   if (!mask) {
-    rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
-                                      ValueRange{val},
-                                      ValueRange{ptr});
+    emitTensorStore(val, ptr);
     rewriter.eraseOp(op);
     return success();
   }
@@ -1107,9 +1119,7 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << "\n"; });
   auto srcSlice = mstate.getExtractSlice(val, loc, rewriter);
   auto dstSubview = mstate.getSubview(ptr, loc, rewriter);
-  rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
-                                    ValueRange{srcSlice},
-                                    ValueRange{dstSubview});
+  emitTensorStore(srcSlice, dstSubview);
   rewriter.eraseOp(op);
   return success();
 }
