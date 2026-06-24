@@ -491,9 +491,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   // 5. Create new hfusion::StoreOp
   builder.create<hfusion::StoreOp>(loc, TypeRange{},
                                    ValueRange{insertSecond.getResult()},
-                                   ValueRange{newCastOp.getResult()},
-                                   hfusion::AtomicKind::NONE,
-                                   ArrayRef<NamedAttribute>{});
+                                   ValueRange{newCastOp.getResult()});
 
   // 6. Erase origin stores
   materializeVec[0]->erase();
@@ -686,9 +684,7 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
   // 7. Create new hfusion::StoreOp
   builder.create<hfusion::StoreOp>(loc, TypeRange{},
                                    ValueRange{newSrcExtractSlice.getResult()},
-                                   ValueRange{newSubviewOpOfReCast.getResult()},
-                                   hfusion::AtomicKind::NONE,
-                                   ArrayRef<NamedAttribute>{});
+                                   ValueRange{newSubviewOpOfReCast.getResult()});
 
   // 8. Erase origin operation
   materializeVec[0]->erase();

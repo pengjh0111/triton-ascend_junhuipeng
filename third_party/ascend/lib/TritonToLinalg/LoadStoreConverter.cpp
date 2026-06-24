@@ -1081,9 +1081,7 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
         ptr, dstOffsets, boundarySizes, loc, rewriter);
     rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
                                       ValueRange{srcSlice},
-                                      ValueRange{dstSubview},
-                                      hfusion::AtomicKind::NONE,
-                                      ArrayRef<NamedAttribute>{});
+                                      ValueRange{dstSubview});
     rewriter.eraseOp(op);
     return success();
   }
@@ -1092,9 +1090,7 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   if (!mask) {
     rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
                                       ValueRange{val},
-                                      ValueRange{ptr},
-                                      hfusion::AtomicKind::NONE,
-                                      ArrayRef<NamedAttribute>{});
+                                      ValueRange{ptr});
     rewriter.eraseOp(op);
     return success();
   }
@@ -1113,9 +1109,7 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   auto dstSubview = mstate.getSubview(ptr, loc, rewriter);
   rewriter.create<hfusion::StoreOp>(loc, TypeRange{},
                                     ValueRange{srcSlice},
-                                    ValueRange{dstSubview},
-                                    hfusion::AtomicKind::NONE,
-                                    ArrayRef<NamedAttribute>{});
+                                    ValueRange{dstSubview});
   rewriter.eraseOp(op);
   return success();
 }
