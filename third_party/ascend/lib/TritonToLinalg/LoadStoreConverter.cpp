@@ -314,7 +314,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       dstOffsets = srcOffsets;
     }
 
-    // hfusion.load on src subview, insert_slice into full dst
+    // Prepare valid-region source tensor (shared by both padding paths).
     auto srcSubView = mlir::ConverterUtils::makeSubViewOp(
         ptr, srcOffsets, boundarySizes, loc, rewriter);
     auto srcSubViewType = cast<MemRefType>(srcSubView.getType());
@@ -322,17 +322,10 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     Value srcT = rewriter.create<bufferization::ToTensorOp>(
         loc, RankedTensorType::get(srcShape, memRefElementType),
         srcSubView.getResult(), /*restrict=*/true, /*writable=*/false);
-    Value loadDst =
-        rewriter.create<tensor::EmptyOp>(loc, boundarySizes, memRefElementType);
-    auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
-    auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
-        loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
-    propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
-                               rewriter);
-    Value loaded = hfuseLoad->getResult(0);
 
-    Value dstTensor;
+    Value result;
     if (padding.has_value()) {
+      // Emit a single hfusion.pad_load instead of fill+load+insert_slice.
       TypedAttr padAttr = rewriter.getZeroAttr(memRefElementType);
       // triton already ensures only NAN and ZERO are passed in
       if (padding.value() == triton::PaddingOption::PAD_NAN) {
@@ -341,19 +334,38 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
             cast<FloatAttr>(padAttr).getValue().getSemantics());
         padAttr = rewriter.getFloatAttr(memRefElementType, apNaN);
       }
-      auto padVal = rewriter.create<arith::ConstantOp>(loc, padAttr);
-      Value fullEmpty =
+      Value padVal = rewriter.create<arith::ConstantOp>(loc, padAttr);
+      Value fullDst =
           rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
-      dstTensor = mlir::ConverterUtils::buildConditionalFillTensor(
-          rewriter, loc, padVal.getResult(), fullEmpty, boundarySizes);
+      // Compute last-dim padding numbers from dstOffsets / boundarySizes.
+      Value leftPad =
+          getValueOrCreateConstantIndexOp(rewriter, loc, dstOffsets.back());
+      Value fullLastDim = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getIndexAttr(memRefShape.back()));
+      Value srcLastDim = getValueOrCreateConstantIndexOp(
+          rewriter, loc, boundarySizes.back());
+      Value rightPad = rewriter.create<arith::SubIOp>(
+          loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
+          srcLastDim);
+      result = rewriter.create<hfusion::PadLoadOp>(
+          loc, srcT, fullDst, padVal, leftPad, rightPad);
     } else {
-      dstTensor =
+      // No padding: hfusion.load on valid subview + insert_slice into full dst.
+      Value loadDst = rewriter.create<tensor::EmptyOp>(loc, boundarySizes,
+                                                       memRefElementType);
+      auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
+      auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
+          loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
+      propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
+                                 rewriter);
+      Value loaded = hfuseLoad->getResult(0);
+      Value dstTensor =
           rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+      SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
+                                            rewriter.getIndexAttr(1));
+      result = rewriter.create<tensor::InsertSliceOp>(
+          loc, loaded, dstTensor, dstOffsets, boundarySizes, unitStrides);
     }
-    SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
-                                          rewriter.getIndexAttr(1));
-    Value result = rewriter.create<tensor::InsertSliceOp>(
-        loc, loaded, dstTensor, dstOffsets, boundarySizes, unitStrides);
     if (mayImplicitTransposeWithLastAxis) {
       auto markOp = rewriter.create<annotation::MarkOp>(loc, result);
       markOp->setAttr(MayImplicitTransposeWithLastAxisTAG,
@@ -434,18 +446,9 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     return failure();
   }
 
-  // hfusion.load on mask subview, insert_slice into full dst
-  Value fullDst =
-      rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
-  if (other) {
-    auto scalarOther =
-        mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
-    assert(scalarOther && "other value used in masked load produced by "
-                          "unsupported instruction!");
-    fullDst = mlir::ConverterUtils::buildConditionalFillTensor(
-        rewriter, loc, scalarOther, fullDst, mstate.dims);
-  }
-
+  // hfusion.load on mask subview, insert_slice into full dst.
+  // When `other` is present and the subview is valid, emit a single
+  // hfusion.pad_load instead of fill+load+insert_slice.
   Value result;
   if (mstate.isMemrefSubviewValid(ptr, rewriter)) {
     memref::SubViewOp srcSubView = mstate.getSubview(ptr, loc, rewriter);
@@ -454,19 +457,52 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
     Value srcT = rewriter.create<bufferization::ToTensorOp>(
         loc, RankedTensorType::get(srcShape, memRefElementType),
         srcSubView.getResult(), /*restrict=*/true, /*writable=*/false);
-    Value loadDst =
-        rewriter.create<tensor::EmptyOp>(loc, mstate.dims, memRefElementType);
-    auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
-    auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
-        loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
-    propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
-                               rewriter);
-    Value loaded = hfuseLoad->getResult(0);
-    SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
-                                          rewriter.getIndexAttr(1));
-    result = rewriter.create<tensor::InsertSliceOp>(
-        loc, loaded, fullDst, mstate.offsets, mstate.dims, unitStrides);
+
+    if (other) {
+      auto scalarOther =
+          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+      assert(scalarOther && "other value used in masked load produced by "
+                            "unsupported instruction!");
+      Value fullDst =
+          rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+      Value leftPad = getValueOrCreateConstantIndexOp(rewriter, loc,
+                                                      mstate.offsets.back());
+      Value fullLastDim = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getIndexAttr(memRefShape.back()));
+      Value srcLastDim =
+          getValueOrCreateConstantIndexOp(rewriter, loc, mstate.dims.back());
+      Value rightPad = rewriter.create<arith::SubIOp>(
+          loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
+          srcLastDim);
+      result = rewriter.create<hfusion::PadLoadOp>(
+          loc, srcT, fullDst, scalarOther, leftPad, rightPad);
+    } else {
+      Value loadDst = rewriter.create<tensor::EmptyOp>(loc, mstate.dims,
+                                                       memRefElementType);
+      auto hfuseLoadTy = cast<RankedTensorType>(loadDst.getType());
+      auto hfuseLoad = rewriter.create<hfusion::LoadOp>(
+          loc, TypeRange{hfuseLoadTy}, ValueRange{srcT}, ValueRange{loadDst});
+      propagateWasBoolToInt8Attr(op.getOperation(), hfuseLoad.getOperation(),
+                                 rewriter);
+      Value loaded = hfuseLoad->getResult(0);
+      Value dst =
+          rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+      SmallVector<OpFoldResult> unitStrides(memRefShape.size(),
+                                            rewriter.getIndexAttr(1));
+      result = rewriter.create<tensor::InsertSliceOp>(
+          loc, loaded, dst, mstate.offsets, mstate.dims, unitStrides);
+    }
   } else {
+    Value fullDst =
+        rewriter.create<tensor::EmptyOp>(loc, memRefShape, memRefElementType);
+    if (other) {
+      auto scalarOther =
+          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+      assert(scalarOther && "other value used in masked load produced by "
+                            "unsupported instruction!");
+      fullDst = mlir::ConverterUtils::buildConditionalFillTensor(
+          rewriter, loc, scalarOther, fullDst, mstate.dims);
+    }
     result = fullDst;
   }
 
