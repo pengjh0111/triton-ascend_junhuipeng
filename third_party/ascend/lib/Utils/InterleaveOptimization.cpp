@@ -327,7 +327,7 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
           loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
           srcLastDim);
       newTensor = rewriter.create<hfusion::PadLoadOp>(
-          loc, srcSubT, fullDst, otherScalar, leftPad, rightPad);
+          loc, srcSubT, fullDst, otherScalar, leftPad, rightPad)->getResult(0);
     } else {
       Value fullDst = rewriter.create<tensor::EmptyOp>(
           loc, srcType.getShape(), srcType.getElementType());

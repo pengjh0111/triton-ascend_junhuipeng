@@ -348,7 +348,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
           loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
           srcLastDim);
       result = rewriter.create<hfusion::PadLoadOp>(
-          loc, srcT, fullDst, padVal, leftPad, rightPad);
+          loc, srcT, fullDst, padVal, leftPad, rightPad)->getResult(0);
     } else {
       // No padding: hfusion.load on valid subview + insert_slice into full dst.
       Value loadDst = rewriter.create<tensor::EmptyOp>(loc, boundarySizes,
@@ -475,7 +475,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
           loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
           srcLastDim);
       result = rewriter.create<hfusion::PadLoadOp>(
-          loc, srcT, fullDst, scalarOther, leftPad, rightPad);
+          loc, srcT, fullDst, scalarOther, leftPad, rightPad)->getResult(0);
     } else {
       Value loadDst = rewriter.create<tensor::EmptyOp>(loc, mstate.dims,
                                                        memRefElementType);
