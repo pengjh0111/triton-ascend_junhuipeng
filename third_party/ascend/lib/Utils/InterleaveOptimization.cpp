@@ -294,10 +294,23 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
     subviewSizes.back() =
         rewriter.getIndexAttr(originSubviewLastDim.value() * 2);
 
-    // 4+5. Build subview tensor; emit pad_load when `other` is present, else
-    //      fall back to hfusion.load + insert_slice into fullDst.
+    // 4. Build full dst tensor; conditionally fill with other if present.
+    // pad_load is NOT used here: the deinterleave mask guarantees the last dim
+    // is always full (entry guard), so left/right padding would be 0. Any row
+    // direction clipping (non-last dims) must be handled by fill+insert_slice.
+    Value fullDst = rewriter.create<tensor::EmptyOp>(
+        loc, srcType.getShape(), srcType.getElementType());
     auto other = op.getOther();
+    if (other) {
+      Value otherScalar =
+          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
+      assert(otherScalar && "other value used in masked load produced by "
+                            "unsupported instruction!");
+      fullDst = mlir::ConverterUtils::buildConditionalFillTensor(
+          rewriter, loc, otherScalar, fullDst, subviewSizes);
+    }
 
+    // 5. hfusion.load on subview of newCastOp, insert_slice into fullDst.
     auto argSubviewType = memref::SubViewOp::inferResultType(
         srcType, subviewOffsets, subviewSizes, subviewStrides);
     memref::SubViewOp srcSubview = rewriter.create<memref::SubViewOp>(
@@ -308,42 +321,18 @@ LogicalResult DeinterleaveStatusWithMaskOptimization(
     Value srcSubT = rewriter.create<bufferization::ToTensorOp>(
         loc, RankedTensorType::get(srcSubviewShape, srcType.getElementType()),
         srcSubview.getResult(), /*restrict=*/true, /*writable=*/false);
-
-    Value newTensor;
-    if (other) {
-      Value otherScalar =
-          mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
-      assert(otherScalar && "other value used in masked load produced by "
-                            "unsupported instruction!");
-      Value fullDst = rewriter.create<tensor::EmptyOp>(
-          loc, srcType.getShape(), srcType.getElementType());
-      Value leftPad = getValueOrCreateConstantIndexOp(rewriter, loc,
-                                                      subviewOffsets.back());
-      Value fullLastDim = rewriter.create<arith::ConstantOp>(
-          loc, rewriter.getIndexAttr(srcType.getShape().back()));
-      Value srcLastDim =
-          getValueOrCreateConstantIndexOp(rewriter, loc, subviewSizes.back());
-      Value rightPad = rewriter.create<arith::SubIOp>(
-          loc, rewriter.create<arith::SubIOp>(loc, fullLastDim, leftPad),
-          srcLastDim);
-      newTensor = rewriter.create<hfusion::PadLoadOp>(
-          loc, srcSubT, fullDst, otherScalar, leftPad, rightPad)->getResult(0);
-    } else {
-      Value fullDst = rewriter.create<tensor::EmptyOp>(
-          loc, srcType.getShape(), srcType.getElementType());
-      Value loadDst = rewriter.create<tensor::EmptyOp>(
-          loc, subviewSizes, srcType.getElementType());
-      auto hfuseLoadTy = llvm::cast<RankedTensorType>(loadDst.getType());
-      Value loadedSlice =
-          rewriter
-              .create<hfusion::LoadOp>(loc, TypeRange{hfuseLoadTy},
-                                       ValueRange{srcSubT}, ValueRange{loadDst})
-              ->getResult(0);
-      SmallVector<OpFoldResult> unitStrides(srcType.getRank(),
-                                            rewriter.getIndexAttr(1));
-      newTensor = rewriter.create<tensor::InsertSliceOp>(
-          loc, loadedSlice, fullDst, subviewOffsets, subviewSizes, unitStrides);
-    }
+    Value loadDst = rewriter.create<tensor::EmptyOp>(
+        loc, subviewSizes, srcType.getElementType());
+    auto hfuseLoadTy = llvm::cast<RankedTensorType>(loadDst.getType());
+    Value loadedSlice =
+        rewriter
+            .create<hfusion::LoadOp>(loc, TypeRange{hfuseLoadTy},
+                                     ValueRange{srcSubT}, ValueRange{loadDst})
+            ->getResult(0);
+    SmallVector<OpFoldResult> unitStrides(srcType.getRank(),
+                                          rewriter.getIndexAttr(1));
+    Value newTensor = rewriter.create<tensor::InsertSliceOp>(
+        loc, loadedSlice, fullDst, subviewOffsets, subviewSizes, unitStrides);
 
     // 6. Implement tensor extract_slice to represent deinterleave
     // Here use `castOffset` to determine whether even index deinterleave or
