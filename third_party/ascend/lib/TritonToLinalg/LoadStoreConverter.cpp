@@ -1104,20 +1104,18 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   auto ptr = adaptor.getPtr();
   auto val = adaptor.getValue();
 
-  // hfusion.store is a linalg-structured op requiring pure tensor semantics.
-  // Pattern: to_tensor(dstMemref) → hfusion.store(ins=src, outs=dstTensor)
-  //          → result tensor → materialize_in_destination → dstMemref.
-  // materialize_in_destination remains responsible for the actual GM write.
+  // tt.store -> single memref-level hfusion.store (no result, has write side
+  // effect, no materialize needed). srcTensor is converted to an identity-layout
+  // memref via ToBufferOp; dstMemref is already the (possibly strided) memref
+  // subview/reinterpret_cast of the GM output param.
   auto emitTensorStore = [&](Value srcTensor, Value dstMemref) {
-    auto tTy = cast<RankedTensorType>(srcTensor.getType());
-    Value dstT = rewriter.create<bufferization::ToTensorOp>(
-        loc, tTy, dstMemref, /*restrict=*/true, /*writable=*/true);
-    auto storeOp = rewriter.create<hfusion::StoreOp>(
-        loc, TypeRange{tTy}, ValueRange{srcTensor}, ValueRange{dstT});
-    Value stored = storeOp->getResult(0);
-    auto mz = rewriter.create<bufferization::MaterializeInDestinationOp>(
-        loc, stored, dstMemref);
-    mz.setWritable(true);
+    auto srcTy = cast<RankedTensorType>(srcTensor.getType());
+    auto srcMemrefTy =
+        MemRefType::get(srcTy.getShape(), srcTy.getElementType());
+    Value srcMemref =
+        rewriter.create<bufferization::ToBufferOp>(loc, srcMemrefTy, srcTensor);
+    rewriter.create<hfusion::StoreOp>(
+        loc, TypeRange{}, ValueRange{srcMemref}, ValueRange{dstMemref});
   };
 
   // 1. boundary size check

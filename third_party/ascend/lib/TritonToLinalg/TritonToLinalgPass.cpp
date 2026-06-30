@@ -1065,14 +1065,9 @@ void TritonToLinalgPass::runOnOperation() {
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>>
       interleaveCandidateWithMask;
   moduleOp.walk([&](hfusion::StoreOp storeOp) {
-    auto destVal = storeOp.getOutputs().front();
+    // With memref-level store, outs is the destination memref directly.
+    Value dest = storeOp.getOutputs().front();
     auto source = storeOp.getInputs().front();
-
-    // Scheme B wraps the dest memref in bufferization.to_tensor; unwrap it.
-    Value dest = destVal;
-    if (auto toTensorOp =
-            destVal.getDefiningOp<bufferization::ToTensorOp>())
-      dest = toTensorOp.getOperand();
 
     if (auto reinterpretCastOp =
             dest.getDefiningOp<memref::ReinterpretCastOp>()) {
@@ -1085,9 +1080,13 @@ void TritonToLinalgPass::runOnOperation() {
     }
 
     // Difference is that converted op chain of store with mask has
-    // `memref::SubViewOp`
+    // `memref::SubViewOp`. With memref-level store, source is ToBufferOp(tensor);
+    // unwrap to reach the original tensor and check for ExtractSliceOp.
     if (auto subviewOp = dest.getDefiningOp<memref::SubViewOp>()) {
-      if (!llvm::isa<tensor::ExtractSliceOp>(source.getDefiningOp()))
+      Value srcTensor = source;
+      if (auto toBufferOp = source.getDefiningOp<bufferization::ToBufferOp>())
+        srcTensor = toBufferOp.getOperand();
+      if (!llvm::isa<tensor::ExtractSliceOp>(srcTensor.getDefiningOp()))
         return WalkResult::advance();
 
       if (auto reinterpretCastOp =
