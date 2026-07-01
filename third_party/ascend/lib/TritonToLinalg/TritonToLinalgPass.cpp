@@ -1064,10 +1064,9 @@ void TritonToLinalgPass::runOnOperation() {
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>> interleaveCandidate;
   llvm::DenseMap<BlockArgument, SmallVector<Operation *>>
       interleaveCandidateWithMask;
-  moduleOp.walk([&](hfusion::StoreOp storeOp) {
-    // With memref-level store, outs is the destination memref directly.
-    Value dest = storeOp.getOutputs().front();
-    auto source = storeOp.getInputs().front();
+  moduleOp.walk([&](hfusion::GMStoreOp gmStoreOp) {
+    Value dest = gmStoreOp.getDst();
+    Value source = gmStoreOp.getSrc();
 
     if (auto reinterpretCastOp =
             dest.getDefiningOp<memref::ReinterpretCastOp>()) {
@@ -1075,18 +1074,14 @@ void TritonToLinalgPass::runOnOperation() {
           reinterpretCastOp.getStaticStrides().back() == 2) {
         interleaveCandidate[llvm::cast<BlockArgument>(
                                 reinterpretCastOp.getSource())]
-            .push_back(storeOp);
+            .push_back(gmStoreOp);
       }
     }
 
     // Difference is that converted op chain of store with mask has
-    // `memref::SubViewOp`. With memref-level store, source is ToBufferOp(tensor);
-    // unwrap to reach the original tensor and check for ExtractSliceOp.
+    // `memref::SubViewOp`. Source is a tensor; check for ExtractSliceOp.
     if (auto subviewOp = dest.getDefiningOp<memref::SubViewOp>()) {
-      Value srcTensor = source;
-      if (auto toBufferOp = source.getDefiningOp<bufferization::ToBufferOp>())
-        srcTensor = toBufferOp.getOperand();
-      if (!llvm::isa<tensor::ExtractSliceOp>(srcTensor.getDefiningOp()))
+      if (!llvm::isa<tensor::ExtractSliceOp>(source.getDefiningOp()))
         return WalkResult::advance();
 
       if (auto reinterpretCastOp =
@@ -1096,7 +1091,7 @@ void TritonToLinalgPass::runOnOperation() {
             reinterpretCastOp.getStaticStrides().back() == 2) {
           interleaveCandidateWithMask[llvm::cast<BlockArgument>(
                                           reinterpretCastOp.getSource())]
-              .push_back(storeOp);
+              .push_back(gmStoreOp);
         }
       }
     }

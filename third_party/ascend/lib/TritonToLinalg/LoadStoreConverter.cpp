@@ -1104,18 +1104,11 @@ StoreConverter::matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
   auto ptr = adaptor.getPtr();
   auto val = adaptor.getValue();
 
-  // tt.store -> single memref-level hfusion.store (no result, has write side
-  // effect, no materialize needed). srcTensor is converted to an identity-layout
-  // memref via ToBufferOp; dstMemref is already the (possibly strided) memref
-  // subview/reinterpret_cast of the GM output param.
+  // tt.store -> single hfusion.gm_store (tensor src, memref dst, no result).
+  // gm_store has a hand-written write side effect on dst, so it won't be DCE'd
+  // and does not trigger bufferization materialization.
   auto emitTensorStore = [&](Value srcTensor, Value dstMemref) {
-    auto srcTy = cast<RankedTensorType>(srcTensor.getType());
-    auto srcMemrefTy =
-        MemRefType::get(srcTy.getShape(), srcTy.getElementType());
-    Value srcMemref =
-        rewriter.create<bufferization::ToBufferOp>(loc, srcMemrefTy, srcTensor);
-    rewriter.create<hfusion::StoreOp>(
-        loc, TypeRange{}, ValueRange{srcMemref}, ValueRange{dstMemref});
+    rewriter.create<hfusion::GMStoreOp>(loc, TypeRange{}, srcTensor, dstMemref);
   };
 
   // 1. boundary size check

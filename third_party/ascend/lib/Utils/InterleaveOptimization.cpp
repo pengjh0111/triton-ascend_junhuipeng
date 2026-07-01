@@ -371,25 +371,13 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   OpBuilder builder(materializeVec[1]);
   auto loc = materializeVec[1]->getLoc();
 
-  // With memref-level store, outs is the destination memref directly.
-  auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
-    return storeOp.getOutputs().front();
-  };
-
-  // With memref-level store, ins is ToBufferOp(srcTensor); unwrap to get the
-  // original tensor for use in tensor::InsertSliceOp.
-  auto getStoreSrcTensor = [](hfusion::StoreOp storeOp) -> Value {
-    Value src = storeOp.getInputs().front();
-    if (auto toBufferOp = src.getDefiningOp<bufferization::ToBufferOp>())
-      src = toBufferOp.getOperand();
-    return src;
-  };
-
   auto firstReinterpretCastOp =
-      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[0]))
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[0])
+          .getDst()
           .getDefiningOp<memref::ReinterpretCastOp>();
   auto secondReinterpretCastOp =
-      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[1]))
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[1])
+          .getDst()
           .getDefiningOp<memref::ReinterpretCastOp>();
 
   assert(firstReinterpretCastOp && secondReinterpretCastOp);
@@ -482,7 +470,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   }
   auto insertFirst = builder.create<tensor::InsertSliceOp>(
       loc,
-      getStoreSrcTensor(llvm::cast<hfusion::StoreOp>(materializeVec[0])),
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[0]).getSrc(),
       emptyTensor.getResult(), insertOffsets, insertSizes, insertStrides);
 
   if (indexModeRecord.second == IndexMode::ODD_MODE) {
@@ -492,7 +480,7 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
   }
   auto insertSecond = builder.create<tensor::InsertSliceOp>(
       loc,
-      getStoreSrcTensor(llvm::cast<hfusion::StoreOp>(materializeVec[1])),
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[1]).getSrc(),
       insertFirst.getResult(), insertOffsets, insertSizes, insertStrides);
 
   // 4. Reinterpret_cast block arg
@@ -504,21 +492,12 @@ InterleaveStatusOptimization(SmallVector<Operation *> materializeVec) {
       loc, dstType, firstReinterpretCastOp.getViewSource(), newCastOffset,
       newCastSize, newCastStride);
 
-  // 5. Create new single memref-level hfusion::StoreOp
-  {
-    auto srcTensor = insertSecond.getResult();
-    auto dstMemref = newCastOp.getResult();
-    auto srcTy = cast<RankedTensorType>(srcTensor.getType());
-    auto srcMemrefTy =
-        MemRefType::get(srcTy.getShape(), srcTy.getElementType());
-    Value srcMemref =
-        builder.create<bufferization::ToBufferOp>(loc, srcMemrefTy, srcTensor);
-    builder.create<hfusion::StoreOp>(
-        loc, TypeRange{}, ValueRange{srcMemref}, ValueRange{dstMemref});
-  }
+  // 5. Create new single hfusion.gm_store (tensor src, memref dst, no result).
+  builder.create<hfusion::GMStoreOp>(loc, TypeRange{},
+                                     insertSecond.getResult(),
+                                     newCastOp.getResult());
 
-  // 6. Erase origin stores. Each origin op in materializeVec is a memref-level
-  // hfusion.store with NO result and no users, so it can be erased directly.
+  // 6. Erase origin stores (gm_store with no result/users -> safe).
   materializeVec[0]->erase();
   materializeVec[1]->erase();
 
@@ -529,34 +508,25 @@ LogicalResult
 InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
   OpBuilder builder(materializeVec[1]);
 
-  // With memref-level store, outs is the destination memref directly.
-  auto getStoreDestMemref = [](hfusion::StoreOp storeOp) -> Value {
-    return storeOp.getOutputs().front();
-  };
-
-  // With memref-level store, ins is ToBufferOp(srcTensor); unwrap to get the
-  // original tensor, then find the defining ExtractSliceOp.
-  auto getStoreSrcExtractSlice =
-      [](hfusion::StoreOp storeOp) -> tensor::ExtractSliceOp {
-    Value src = storeOp.getInputs().front();
-    if (auto toBufferOp = src.getDefiningOp<bufferization::ToBufferOp>())
-      src = toBufferOp.getOperand();
-    return src.getDefiningOp<tensor::ExtractSliceOp>();
-  };
-
   auto firstSubviewOpOfReCast =
-      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[0]))
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[0])
+          .getDst()
           .getDefiningOp<memref::SubViewOp>();
   auto firstSrcExtractSlice =
-      getStoreSrcExtractSlice(llvm::cast<hfusion::StoreOp>(materializeVec[0]));
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[0])
+          .getSrc()
+          .getDefiningOp<tensor::ExtractSliceOp>();
   auto firstReinterpretCastOp = firstSubviewOpOfReCast.getSource()
                                     .getDefiningOp<memref::ReinterpretCastOp>();
 
   auto secondSubviewOpOfReCast =
-      getStoreDestMemref(llvm::cast<hfusion::StoreOp>(materializeVec[1]))
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[1])
+          .getDst()
           .getDefiningOp<memref::SubViewOp>();
   auto secondSrcExtractSlice =
-      getStoreSrcExtractSlice(llvm::cast<hfusion::StoreOp>(materializeVec[1]));
+      llvm::cast<hfusion::GMStoreOp>(materializeVec[1])
+          .getSrc()
+          .getDefiningOp<tensor::ExtractSliceOp>();
   auto secondReinterpretCastOp =
       secondSubviewOpOfReCast.getSource()
           .getDefiningOp<memref::ReinterpretCastOp>();
@@ -715,21 +685,12 @@ InterleaveStatusWithMaskOptimization(SmallVector<Operation *> materializeVec) {
       loc, llvm::cast<MemRefType>(dstSubviewType), newCastOp, extractOffsets,
       extractSizes, extractStrides);
 
-  // 7. Create new single memref-level hfusion::StoreOp
-  {
-    auto srcTensor = newSrcExtractSlice.getResult();
-    auto dstMemref = newSubviewOpOfReCast.getResult();
-    auto srcTy = cast<RankedTensorType>(srcTensor.getType());
-    auto srcMemrefTy =
-        MemRefType::get(srcTy.getShape(), srcTy.getElementType());
-    Value srcMemref =
-        builder.create<bufferization::ToBufferOp>(loc, srcMemrefTy, srcTensor);
-    builder.create<hfusion::StoreOp>(
-        loc, TypeRange{}, ValueRange{srcMemref}, ValueRange{dstMemref});
-  }
+  // 7. Create new single hfusion.gm_store (tensor src, memref dst, no result).
+  builder.create<hfusion::GMStoreOp>(loc, TypeRange{},
+                                     newSrcExtractSlice.getResult(),
+                                     newSubviewOpOfReCast.getResult());
 
-  // 8. Erase origin operation. Each origin op is a memref-level hfusion.store
-  // with NO result and no users, so it can be erased directly.
+  // 8. Erase origin stores (gm_store with no result/users -> safe).
   materializeVec[0]->erase();
   materializeVec[1]->erase();
   if (firstSubviewOpOfReCast->use_empty()) {
